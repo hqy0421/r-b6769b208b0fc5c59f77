@@ -1,3 +1,16 @@
+1.0.17 18/11/2026
+
+* Add TransactionalBinLogConsumer: acknowledgment-based, transaction-boundary
+  binlog consumption with at-least-once delivery, out-of-order acks, and a
+  durable checkpoint that only advances over the continuous acknowledged
+  prefix. The existing BinLogStreamReader interface is unchanged.
+* Add optional resume_position_callback / on_reconnect_callback hooks to
+  BinLogStreamReader so callers can reopen from a durable checkpoint and fence
+  off delivery tokens minted by previous connection attempts.
+* Freeze row-event payloads into an independent packet so lazily decoded row
+  values stay correct after the shared network buffer has been drained by
+  later events, including binlog-checksum enabled events.
+
 1.0.16 12/07/2026
 
 * Parse FormatDescriptionEvent post-header lengths and use them to align event payloads.

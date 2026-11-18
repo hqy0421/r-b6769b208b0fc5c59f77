@@ -21,3 +21,14 @@ limitations under the License.
 """
 
 from .binlogstream import BinLogStreamReader
+from .transaction import (
+    BinLogPosition,
+    CheckpointError,
+    CheckpointStore,
+    DeliveryToken,
+    FileCheckpointStore,
+    MemoryCheckpointStore,
+    StaleDeliveryTokenError,
+    TransactionBatch,
+    TransactionalBinLogConsumer,
+)

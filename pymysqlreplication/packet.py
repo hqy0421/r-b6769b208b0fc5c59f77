@@ -82,6 +82,9 @@ class BinLogPacketWrapper(object):
         self.read_bytes = 0
         # Used when we want to override a value in the data buffer
         self.__data_buffer = b""
+        # Exposed so row events can exclude the trailing checksum footer when
+        # freezing their payload for lazy decoding.
+        self.use_checksum = use_checksum
 
         self.packet = from_packet
         self.charset = ctl_connection.charset

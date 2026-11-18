@@ -191,6 +191,8 @@ class BinLogStreamReader(object):
         verify_checksum=False,
         enable_logging=True,
         use_column_name_cache=False,
+        resume_position_callback=None,
+        on_reconnect_callback=None,
     ):
         """
         Attributes:
@@ -299,6 +301,22 @@ class BinLogStreamReader(object):
         self.mysql_version = (0, 0, 0)
         self.dbms = None
 
+        # Optional hooks used by the transactional consumer.  Both default to
+        # no-ops so the historical stream behavior is unchanged.
+        #
+        # resume_position_callback() -> (log_file, log_pos) | None
+        #   Called when the stream is (re)opened after a connection loss or an
+        #   EOF, to reposition the new connection at a caller managed
+        #   checkpoint rather than the last raw read position.
+        #
+        # on_reconnect_callback() -> None
+        #   Called after every successful reopen (never on the first
+        #   connection) so callers can invalidate delivery state minted by the
+        #   previous connection.
+        self.__resume_position_callback = resume_position_callback
+        self.__on_reconnect_callback = on_reconnect_callback
+        self.__ever_connected = False
+
     def close(self):
         if self.__connected_stream:
             self._stream_connection.close()
@@ -364,6 +382,22 @@ class BinLogStreamReader(object):
         # server_id (4) -- server id of this slave
         # log_file (string.EOF) -- filename of the binlog on the master
         self._stream_connection = self.pymysql_wrapper(**self.__connection_settings)
+
+        # On every reopen after the first successful connection, give callers
+        # the chance to reposition the stream at their own durable checkpoint
+        # instead of the last raw read position.  The first connection keeps
+        # using the constructor supplied log_file/log_pos/auto_position.
+        if (
+            self.__ever_connected
+            and not self.auto_position
+            and self.__resume_position_callback is not None
+        ):
+            resumed = self.__resume_position_callback()
+            if resumed is not None:
+                self.log_file, self.log_pos = resumed
+                # An explicit checkpoint coordinate must be sent to the
+                # server as the COM_BINLOG_DUMP start position.
+                self.__resume_stream = True
 
         self.__use_checksum = self.__checksum_enabled()
 
@@ -530,6 +564,10 @@ class BinLogStreamReader(object):
             self._stream_connection._write_bytes(prelude)
             self._stream_connection._next_seq_id = 1
         self.__connected_stream = True
+
+        if self.__ever_connected and self.__on_reconnect_callback is not None:
+            self.__on_reconnect_callback()
+        self.__ever_connected = True
 
     def __set_mariadb_settings(self):
         # https://mariadb.com/kb/en/5-slave-registration/

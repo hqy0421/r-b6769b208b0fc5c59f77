@@ -6,6 +6,7 @@ from pymysql.charset import charset_by_name
 from enum import Enum
 
 from .event import BinLogEvent
+from .exceptions import MalformedBinLogEvent
 from .logger import logger
 from .constants import FIELD_TYPE
 from .constants import BINLOG
@@ -19,6 +20,257 @@ from .bitmap import BitCount, BitGet
 
 # MySQL 5.7 compatibility: Cache for INFORMATION_SCHEMA column names
 _COLUMN_NAME_CACHE = {}
+
+
+class _FrozenRowPacket(object):
+    """A self contained packet over a frozen row payload.
+
+    Row events decode their rows lazily through the ``rows`` property.  The
+    underlying network packet is reused for every subsequent event and its
+    buffer is drained as the stream advances, so decoding rows after reading
+    more events would read the wrong bytes (or no bytes at all).  This wrapper
+    holds an independent copy of the row payload and exposes exactly the
+    surface used while decoding, keeping lazy decoding correct regardless of
+    how many events have been read since.
+
+    Every reader is implemented against a single cursor (``read_bytes``) over
+    the frozen bytes, mirroring :class:`BinLogPacketWrapper`.  In particular no
+    read is delegated to a second packet with its own cursor, which would let
+    the two positions drift and corrupt the payload-boundary accounting used
+    by lazy row decoding.
+    """
+
+    # Length-coded-binary sentinels, matching pymysql's protocol constants.
+    _NULL_COLUMN = 251
+    _UNSIGNED_CHAR_COLUMN = 251
+    _UNSIGNED_SHORT_COLUMN = 252
+    _UNSIGNED_INT24_COLUMN = 253
+    _UNSIGNED_INT64_COLUMN = 254
+    _UNSIGNED_SHORT_LENGTH = 2
+    _UNSIGNED_INT24_LENGTH = 3
+    _UNSIGNED_INT64_LENGTH = 8
+
+    def __init__(self, payload, charset, header=None):
+        self._data = bytes(payload)
+        self.charset = charset
+        # Single cursor over the payload, starting at the first row byte.
+        self.read_bytes = 0
+        # Total length of the frozen row payload, used by lazy row decoding to
+        # detect the end of the rows without referencing the original (now
+        # detached and possibly drained) network packet.
+        self.payload_size = len(self._data)
+        # Preserve the original event header so callers can still compute
+        # binlog coordinates (log_pos/event_size/...) after the payload has
+        # been detached from the shared network packet.
+        if header is not None:
+            for attr in (
+                "log_pos",
+                "event_type",
+                "server_id",
+                "event_size",
+                "timestamp",
+                "flags",
+                "use_checksum",
+            ):
+                setattr(self, attr, getattr(header, attr, None))
+
+    # ------------------------------------------------------------------
+    # Primitive cursor operations
+    # ------------------------------------------------------------------
+    def read(self, size):
+        # Callers pass float sizes (e.g. (n + 7) / 8 for bitmaps); normalise
+        # them before slicing so no bytes are silently dropped.
+        size = int(size)
+        end = self.read_bytes + size
+        result = self._data[self.read_bytes : end]
+        if len(result) != size:
+            raise AssertionError(
+                "Result length not requested length:\n"
+                f"Expected={size}.  Actual={len(result)}.  "
+                f"Position: {self.read_bytes}.  Data Length: {self.payload_size}"
+            )
+        self.read_bytes = end
+        return result
+
+    def unread(self, data):
+        # Only used by the NEWDECIMAL reader, which pushes a single byte back.
+        self.read_bytes -= len(data)
+
+    def advance(self, size):
+        size = int(size)
+        new_position = self.read_bytes + size
+        if new_position < 0 or new_position > self.payload_size:
+            raise Exception(
+                f"Invalid advance amount ({size}) for cursor.  "
+                f"Position={new_position}"
+            )
+        self.read_bytes = new_position
+
+    def rewind(self, size):
+        self.advance(-int(size))
+
+    # ------------------------------------------------------------------
+    # Length coded values
+    # ------------------------------------------------------------------
+    def read_length_coded_binary(self):
+        c = struct.unpack("!B", self.read(1))[0]
+        if c == self._NULL_COLUMN:
+            return None
+        if c < self._UNSIGNED_CHAR_COLUMN:
+            return c
+        elif c == self._UNSIGNED_SHORT_COLUMN:
+            return struct.unpack("<H", self.read(self._UNSIGNED_SHORT_LENGTH))[0]
+        elif c == self._UNSIGNED_INT24_COLUMN:
+            return self._unpack_int24(self.read(self._UNSIGNED_INT24_LENGTH))
+        elif c == self._UNSIGNED_INT64_COLUMN:
+            return struct.unpack("<Q", self.read(self._UNSIGNED_INT64_LENGTH))[0]
+
+    def read_length_coded_pascal_string(self, size):
+        length = self.read_uint_by_size(size)
+        return self.read(length)
+
+    def read_variable_length_string(self):
+        byte = 0x80
+        length = 0
+        bits_read = 0
+        while byte & 0x80 != 0:
+            byte = struct.unpack("!B", self.read(1))[0]
+            length = length | ((byte & 0x7F) << bits_read)
+            bits_read = bits_read + 7
+        return self.read(length)
+
+    def read_binary_json(self, size, is_partial):
+        # Same binary JSON encoding as BinLogPacketWrapper.read_binary_json.
+        from .json_binary import parse_json, JsonDiff, JsonDiffOperation
+        from .util.bytes import length_encoded_int
+
+        length = self.read_uint_by_size(size)
+        if length == 0:
+            # handle NULL value
+            return None
+        data = self.read(length)
+        if is_partial:
+            operation_number = data[0]
+            json_operation = JsonDiffOperation.by_index(operation_number)
+            data = data[1:]
+            path_length, _, n = length_encoded_int(data)
+            data = data[n:]
+
+            path = data[:path_length]
+            data = data[path_length:]
+
+            value_length, _, n = length_encoded_int(data)
+            if json_operation == JsonDiffOperation.Remove:
+                return JsonDiff(json_operation, path)
+
+            data = data[n:]
+            data = data[:value_length]
+            data = parse_json(data[0], data[1:])
+            return JsonDiff(json_operation, path, data)
+        return parse_json(data[0], data[1:])
+
+    def read_string(self):
+        # Read until the NULL terminator (0 = \0).
+        start = self.read_bytes
+        end = self._data.find(b"\0", start)
+        if end == -1:
+            raise AssertionError("Unterminated string in frozen row payload")
+        string = self._data[start:end]
+        self.read_bytes = end + 1
+        return string
+
+    def bytes_to_read(self):
+        return self.payload_size - self.read_bytes
+
+    def read_available(self):
+        return self.read(self.bytes_to_read())
+
+    # ------------------------------------------------------------------
+    # Fixed width integers
+    # ------------------------------------------------------------------
+    def read_int_be_by_size(self, size):
+        if size == 1:
+            return struct.unpack(">b", self.read(size))[0]
+        elif size == 2:
+            return struct.unpack(">h", self.read(size))[0]
+        elif size == 3:
+            return self._read_int24_be()
+        elif size == 4:
+            return struct.unpack(">i", self.read(size))[0]
+        elif size == 5:
+            return self.read_int40_be()
+        elif size == 8:
+            return struct.unpack(">q", self.read(size))[0]
+
+    def read_uint_by_size(self, size):
+        if size == 1:
+            return self.read_uint8()
+        elif size == 2:
+            return self.read_uint16()
+        elif size == 3:
+            return self.read_uint24()
+        elif size == 4:
+            return self.read_uint32()
+        elif size == 5:
+            return self.read_uint40()
+        elif size == 6:
+            return self.read_uint48()
+        elif size == 7:
+            return self.read_uint56()
+        elif size == 8:
+            return self.read_uint64()
+
+    def read_uint8(self):
+        return struct.unpack("<B", self.read(1))[0]
+
+    def read_int16(self):
+        return struct.unpack("<h", self.read(2))[0]
+
+    def read_uint16(self):
+        return struct.unpack("<H", self.read(2))[0]
+
+    def read_uint24(self):
+        a, b, c = struct.unpack("<BBB", self.read(3))
+        return a + (b << 8) + (c << 16)
+
+    def _read_int24_be(self):
+        a, b, c = struct.unpack("<BBB", self.read(3))
+        res = (a << 16) | (b << 8) | c
+        if res >= 0x800000:
+            res -= 0x1000000
+        return res
+
+    @staticmethod
+    def _unpack_int24(n):
+        return n[0] + (n[1] << 8) + (n[2] << 16)
+
+    def read_uint32(self):
+        return struct.unpack("<I", self.read(4))[0]
+
+    def read_int32(self):
+        return struct.unpack("<i", self.read(4))[0]
+
+    def read_uint40(self):
+        a, b = struct.unpack("<BI", self.read(5))
+        return a + (b << 8)
+
+    def read_int40_be(self):
+        a, b = struct.unpack(">IB", self.read(5))
+        return b + (a << 8)
+
+    def read_uint48(self):
+        a, b, c = struct.unpack("<HHH", self.read(6))
+        return a + (b << 16) + (c << 32)
+
+    def read_uint56(self):
+        a, b, c = struct.unpack("<BHI", self.read(7))
+        return a + (b << 8) + (c << 24)
+
+    def read_uint64(self):
+        return struct.unpack("<Q", self.read(8))[0]
+
+    def read_int64(self):
+        return struct.unpack("<q", self.read(8))[0]
 
 
 def fetch_column_names(ctl_connection, schema, table, use_column_name_cache=False, enable_logging=False):
@@ -161,6 +413,42 @@ class RowsEvent(BinLogEvent):
         # Body
         self.number_of_columns = self.packet.read_length_coded_binary()
         self.columns = self.table_map[self.table_id].columns
+
+    def _freeze_row_payload(self):
+        """Snapshot the not-yet-decoded row bytes.
+
+        Called by row event subclasses once their column-present bitmaps have
+        been consumed.  From that point on lazy row decoding runs against an
+        independent packet holding a copy of the payload, so later events
+        draining the shared network buffer cannot corrupt ``rows``.  Only the
+        per-row data (each row's null bitmap followed by its values) is kept;
+        the column-present bitmaps stay as event attributes.
+        """
+
+        if not self._processed:
+            return
+        original_packet = self.packet
+        checksum_len = (
+            4 if getattr(original_packet, "use_checksum", False) else 0
+        )
+        # The shared network packet holds the full on-disk event: the 19-byte
+        # event header plus the leading OK byte (20 bytes that the wrapper
+        # skips), then the body, then an optional 4-byte checksum footer.  Its
+        # inner cursor is already positioned just past the consumed
+        # column-present bitmaps, so the bytes left to decode are the packet's
+        # own remaining length, excluding the checksum footer.  Measuring from
+        # the packet length (rather than reconstructing it from the body-only
+        # ``self.event_size``) stays correct in both checksum modes.
+        inner = original_packet.packet
+        remaining = len(inner._data) - inner._position - checksum_len
+        if remaining < 0:
+            remaining = 0
+        payload = original_packet.read(remaining)
+        # Consume and discard the checksum footer through the shared packet.
+        if checksum_len:
+            original_packet.advance(checksum_len)
+        charset = getattr(original_packet, "charset", "utf8")
+        self.packet = _FrozenRowPacket(payload, charset, header=original_packet)
 
     @staticmethod
     def _is_null(null_bitmap, position):
@@ -629,14 +917,36 @@ class RowsEvent(BinLogEvent):
             f"Column Name Information Flag: {self.table_map[self.table_id].column_name_flag}"
         )
 
+    def _remaining_payload(self):
+        """Bytes of row payload still available to decode."""
+
+        packet = self.packet
+        if isinstance(packet, _FrozenRowPacket):
+            # The frozen packet starts at the first row byte and counts from
+            # zero, so its own length is the correct boundary.
+            return packet.payload_size - packet.read_bytes
+        return self.event_size - packet.read_bytes
+
     def _fetch_rows(self):
         self.__rows = []
 
         if not self.complete:
             return
 
-        while self.packet.read_bytes < self.event_size:
+        # Each row starts with its own null bitmap followed by the present
+        # column values.  Decode rows until the frozen payload is exhausted;
+        # ``read_bytes`` is measured against the payload's own length (the
+        # frozen packet starts at the first row byte).
+        while self._remaining_payload() > 0:
+            before = self.packet.read_bytes
             self.__rows.append(self._fetch_one_row())
+            if self.packet.read_bytes <= before:
+                # A decoder that made no progress would loop forever on a
+                # truncated or malformed payload; fail loudly instead.
+                raise MalformedBinLogEvent(
+                    "Row event payload could not be fully decoded: "
+                    f"{self._remaining_payload()} byte(s) left"
+                )
 
     @property
     def rows(self):
@@ -657,6 +967,7 @@ class DeleteRowsEvent(RowsEvent):
             self.columns_present_bitmap = self.packet.read(
                 (self.number_of_columns + 7) / 8
             )
+            self._freeze_row_payload()
 
     def _fetch_one_row(self):
         row = {}
@@ -693,6 +1004,7 @@ class WriteRowsEvent(RowsEvent):
             self.columns_present_bitmap = self.packet.read(
                 (self.number_of_columns + 7) / 8
             )
+            self._freeze_row_payload()
 
     def _fetch_one_row(self):
         row = {}
@@ -739,6 +1051,7 @@ class UpdateRowsEvent(RowsEvent):
             self.columns_present_bitmap2 = self.packet.read(
                 (self.number_of_columns + 7) / 8
             )
+            self._freeze_row_payload()
 
     def _fetch_one_row(self):
         row = {}

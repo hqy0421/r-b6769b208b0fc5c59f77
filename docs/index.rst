@@ -28,6 +28,7 @@ Contents
     limitations
     mysql57_support
     binlogstream
+    transaction
     events
     examples
     support
